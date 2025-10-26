@@ -31,7 +31,9 @@ resource "aws_s3_bucket" "example" {
   bucket = "example-prod-bucket-${data.aws_caller_identity.current.account_id}"
   
   tags = {
-    Name = "Production Example Bucket"
+    Name           = "Production Example Bucket"
+    TestPipeline   = "prod-test"
+    Environment    = "production"
   }
 }
 
