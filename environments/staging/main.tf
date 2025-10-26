@@ -31,7 +31,9 @@ resource "aws_s3_bucket" "example" {
   bucket = "example-staging-bucket-${data.aws_caller_identity.current.account_id}"
   
   tags = {
-    Name = "Staging Example Bucket"
+    Name           = "Staging Example Bucket"
+    TestPipeline   = "staging-test"
+    Environment    = "staging"
   }
 }
 
