@@ -60,3 +60,6 @@ config
 # Temporary files
 tmp/
 temp/
+
+# MCP servers directory
+servers/
