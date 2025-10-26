@@ -32,6 +32,7 @@ resource "aws_s3_bucket" "example" {
   
   tags = {
     Name = "Dev Example Bucket"
+    TestPipeline = "wildcard-test"  # Testing with wildcard OIDC pattern
   }
 }
 
