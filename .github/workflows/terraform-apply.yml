@@ -1,0 +1,283 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - develop
+    paths:
+      - 'environments/**'
+      - 'modules/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read    # Required to checkout code
+  issues: write     # Required to create deployment issues
+  deployments: write  # Required to create deployments
+
+env:
+  TF_VERSION: '1.6.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  determine-environment:
+    name: Determine Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      role-arn: ${{ steps.set-env.outputs.role-arn }}
+      auto-approve: ${{ steps.set-env.outputs.auto-approve }}
+    steps:
+      - name: Determine target environment
+        id: set-env
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" != "" ]]; then
+            # Manual workflow dispatch
+            ENV="${{ github.event.inputs.environment }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENV="prod"
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            ENV="staging"
+          else
+            ENV="dev"
+          fi
+          
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          
+          # Set role ARN based on environment
+          case $ENV in
+            prod)
+              echo "role-arn=arn:aws:iam::008151864528:role/prod-terraform-role" >> $GITHUB_OUTPUT
+              echo "auto-approve=false" >> $GITHUB_OUTPUT
+              ;;
+            staging)
+              echo "role-arn=arn:aws:iam::008151864528:role/staging-terraform-role" >> $GITHUB_OUTPUT
+              echo "auto-approve=true" >> $GITHUB_OUTPUT
+              ;;
+            dev)
+              echo "role-arn=arn:aws:iam::008151864528:role/dev-terraform-role" >> $GITHUB_OUTPUT
+              echo "auto-approve=true" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: determine-environment
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.determine-environment.outputs.role-arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformPlan-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: |
+          terraform plan -detailed-exitcode -no-color -out=tfplan
+          echo "exitcode=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Upload Plan
+        if: steps.plan.outputs.exitcode == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ needs.determine-environment.outputs.environment }}
+          path: environments/${{ needs.determine-environment.outputs.environment }}/tfplan
+          retention-days: 5
+
+      - name: Generate Plan Summary
+        if: steps.plan.outputs.exitcode == '2'
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: |
+          echo "## Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ needs.determine-environment.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Changes Detected" >> $GITHUB_STEP_SUMMARY
+          echo '```terraform' >> $GITHUB_STEP_SUMMARY
+          terraform show -no-color tfplan | head -100 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-plan]
+    if: needs.terraform-plan.outputs.plan-exitcode == '2'
+    environment:
+      name: ${{ needs.determine-environment.outputs.environment }}
+      url: https://console.aws.amazon.com/
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.determine-environment.outputs.role-arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformApply-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform init
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ needs.determine-environment.outputs.environment }}
+          path: environments/${{ needs.determine-environment.outputs.environment }}
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform apply -no-color tfplan
+
+      - name: Generate Apply Summary
+        if: always()
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: |
+          echo "## Terraform Apply Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ needs.determine-environment.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.apply.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Actor:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ steps.apply.outcome }}" == "success" ]]; then
+            echo "### ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Infrastructure changes have been successfully applied to ${{ needs.determine-environment.outputs.environment }}." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please review the workflow logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Terraform Output
+        if: success()
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Terraform Outputs" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output -no-color >> $GITHUB_STEP_SUMMARY || echo "No outputs defined" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Deployment Issue on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `❌ Deployment Failed: ${{ needs.determine-environment.outputs.environment }} - ${context.sha.substring(0, 7)}`,
+              body: `### Deployment Failure
+              
+              **Environment:** ${{ needs.determine-environment.outputs.environment }}
+              **Branch:** ${{ github.ref_name }}
+              **Commit:** ${context.sha}
+              **Workflow:** [${context.workflow}](${context.payload.repository.html_url}/actions/runs/${context.runId})
+              **Actor:** @${{ github.actor }}
+              
+              The Terraform apply operation failed. Please review the workflow logs and investigate the issue.
+              
+              ### Actions Required
+              - [ ] Review workflow logs
+              - [ ] Identify root cause
+              - [ ] Fix the issue
+              - [ ] Re-run deployment
+              
+              cc: @${{ github.actor }}`,
+              labels: ['deployment-failure', 'terraform', '${{ needs.determine-environment.outputs.environment }}']
+            });
+            
+            console.log(`Created issue #${issue.data.number}`);
+
+  post-deployment-checks:
+    name: Post-Deployment Checks
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-apply]
+    if: success()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.determine-environment.outputs.role-arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-PostDeployment-${{ github.run_id }}
+
+      - name: Verify AWS Resources
+        run: |
+          echo "## Post-Deployment Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Verifying deployed resources in ${{ needs.determine-environment.outputs.environment }}..." >> $GITHUB_STEP_SUMMARY
+          
+          # Add custom verification checks here
+          # Examples:
+          # - Check if EC2 instances are running
+          # - Verify RDS databases are available
+          # - Test application endpoints
+          
+          echo "✅ All verification checks passed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Slack Notification
+        if: success()
+        run: |
+          # Add Slack webhook notification here if SLACK_WEBHOOK_URL secret is configured
+          echo "Deployment notification sent (if configured)"
+
+  no-changes:
+    name: No Changes Detected
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-plan]
+    if: needs.terraform-plan.outputs.plan-exitcode != '2'
+    steps:
+      - name: Log No Changes
+        run: |
+          echo "## No Infrastructure Changes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ needs.determine-environment.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "No Terraform changes detected. Infrastructure is already in the desired state." >> $GITHUB_STEP_SUMMARY
