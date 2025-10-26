@@ -1,0 +1,267 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches:
+      - main
+      - staging
+      - develop
+    paths:
+      - 'environments/**'
+      - 'modules/**'
+      - '.github/workflows/terraform-*.yml'
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read    # Required to checkout code
+  pull-requests: write  # Required to comment on PRs
+
+env:
+  TF_VERSION: '1.6.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  determine-environment:
+    name: Determine Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      role-arn: ${{ steps.set-env.outputs.role-arn }}
+    steps:
+      - name: Determine target environment
+        id: set-env
+        run: |
+          if [[ "${{ github.base_ref }}" == "main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "role-arn=arn:aws:iam::008151864528:role/prod-terraform-role" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.base_ref }}" == "staging" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "role-arn=arn:aws:iam::008151864528:role/staging-terraform-role" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "role-arn=arn:aws:iam::008151864528:role/dev-terraform-role" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    needs: determine-environment
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform validate -no-color
+
+      - name: Comment validation results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `### Terraform Validation Results
+            
+            #### Format Check \`${{ steps.fmt.outcome }}\`
+            #### Validation \`${{ steps.validate.outcome }}\`
+            
+            <details><summary>Validation Output</summary>
+            
+            \`\`\`
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+            
+            </details>
+            
+            *Environment: ${{ needs.determine-environment.outputs.environment }}*
+            *Pushed by: @${{ github.actor }}*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: determine-environment
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        id: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: environments/${{ needs.determine-environment.outputs.environment }}
+          soft_fail: true
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: environments/${{ needs.determine-environment.outputs.environment }}
+          framework: terraform
+          soft_fail: true
+          output_format: cli
+
+      - name: Comment security scan results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `### Security Scan Results
+            
+            #### tfsec \`${{ steps.tfsec.outcome }}\`
+            #### Checkov \`${{ steps.checkov.outcome }}\`
+            
+            *Environment: ${{ needs.determine-environment.outputs.environment }}*
+            
+            Review the workflow logs for detailed security findings.`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-validate]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.determine-environment.outputs.role-arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformPlan
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        id: init
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Save Plan
+        if: steps.plan.outcome == 'success'
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform show -no-color tfplan > plan.txt
+
+      - name: Comment Plan
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planPath = 'environments/${{ needs.determine-environment.outputs.environment }}/plan.txt';
+            let plan = '';
+            
+            if (fs.existsSync(planPath)) {
+              plan = fs.readFileSync(planPath, 'utf8');
+              // Truncate if too long
+              if (plan.length > 60000) {
+                plan = plan.substring(0, 60000) + '\n\n... (plan truncated)';
+              }
+            } else {
+              plan = 'Plan file not found or plan failed';
+            }
+            
+            const output = `### Terraform Plan Results
+            
+            #### Terraform Plan \`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+            
+            </details>
+            
+            *Environment: ${{ needs.determine-environment.outputs.environment }}*
+            *Pushed by: @${{ github.actor }}*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  cost-estimate:
+    name: Cost Estimate
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-plan]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.determine-environment.outputs.role-arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-CostEstimate
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: terraform init
+
+      - name: Generate Infracost JSON
+        working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+        run: |
+          infracost breakdown --path=. \
+            --format=json \
+            --out-file=/tmp/infracost.json || echo "Cost estimation skipped"
+
+      - name: Post Infracost Comment
+        if: success()
+        run: |
+          infracost comment github \
+            --path=/tmp/infracost.json \
+            --repo=$GITHUB_REPOSITORY \
+            --github-token=${{ secrets.GITHUB_TOKEN }} \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --behavior=update || echo "Cost comment skipped"
