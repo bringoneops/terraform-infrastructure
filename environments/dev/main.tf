@@ -32,7 +32,7 @@ resource "aws_s3_bucket" "example" {
   
   tags = {
     Name = "Dev Example Bucket"
-    TestPipeline = "true"  # Added to test CI/CD pipeline
+    TestPipeline = "verified"  # Testing OIDC fix
   }
 }
 
